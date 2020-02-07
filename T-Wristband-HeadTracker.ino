@@ -10,17 +10,20 @@
 #include "xMPU9250.h"
 #include "openTrack.h"
 
+// switches
 #define ARDUINO_OTA_UPDATE      //! Enable this line OTA update
 //#define CALIBRATE_MAGNETOMETER //! calibrate magnemoter -> move in a 8
 #define IMU_SHOW
 #define SEND_TO_OPENTRACK
 
+// libs for OTA
 #ifdef ARDUINO_OTA_UPDATE
 #include <ESPmDNS.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
 #endif
 
+// hardware adresses
 #define TP_PIN_PIN          33
 #define I2C_SDA_PIN         21
 #define I2C_SCL_PIN         22
@@ -33,21 +36,21 @@
 #define CHARGE_PIN          32
 
 // chips
-xMPU9250         IMU(Wire,0x69);
+xMPU9250         imu(Wire,0x69);
 TFT_eSPI        tft = TFT_eSPI(); 
+
+// MPU9250
 
 // vars
 char buff[256];
-bool initial = 1;
 bool otaStart = false;
-uint32_t targetTime = 0;       // for next 1 second timeout
-uint8_t omm = 99;
-bool pressed = false;
-uint32_t pressedTime = 0;
-bool charge_indication = false;
 
-// Flag set to indicate MPU 9250 data is ready (will be set in interrupt service routine ISR)
+bool pressed = false;
+uint32_t targetTimeForSleep = 0;
+
+// vars written by interrupt service routines / ISR
 volatile bool imu_data_ready = false;
+volatile bool charge_indication = false;
 
 void drawProgressBar(uint16_t x0, uint16_t y0, uint16_t w, uint16_t h, uint8_t percentage, uint16_t frameColor, uint16_t barColor)
 {
@@ -139,11 +142,9 @@ void setupOTA()
         tft.drawString("Update Failed", tft.width() / 2 - 20, 55 );
         delay(3000);
         otaStart = false;
-        initial = 1;
         targetTime = millis() + 1000;
         tft.fillScreen(TFT_BLACK);
         tft.setTextDatum(TL_DATUM);
-        omm = 99;
     });
 
     ArduinoOTA.begin();
@@ -163,20 +164,20 @@ void setupMpu9250() {
     // initialize IMU 
     DCLEAR();
     DPRINT("Initializing IMU / MPU9250");
-    int status = IMU.begin();
+    int status = imu.begin();
     DPRINT("status = %i", status);
     if (status < 0) {
       DPRINT("... ERROR");
     }
     else {
       // setting the accelerometer full scale range to +/-8G 
-      IMU.setAccelRange(MPU9250::ACCEL_RANGE_8G);
+      imu.setAccelRange(MPU9250::ACCEL_RANGE_8G);
       // setting the gyroscope full scale range to +/-500 deg/s
-      IMU.setGyroRange(MPU9250::GYRO_RANGE_500DPS);
+      imu.setGyroRange(MPU9250::GYRO_RANGE_500DPS);
       // setting DLPF bandwidth to 20 Hz
-      IMU.setDlpfBandwidth(MPU9250::DLPF_BANDWIDTH_20HZ);
+      imu.setDlpfBandwidth(MPU9250::DLPF_BANDWIDTH_20HZ);
       // setting SRD to 19 for a 50 Hz update rate
-      IMU.setSrd(19);
+      imu.setSrd(19);
       DPRINT("... done");
     }
     DWAIT();
@@ -187,13 +188,13 @@ void setupMpu9250() {
     DPRINT("Calibrating magnetometer,");
     DPRINT(".. please slowly move in a");
     DPRINT(".. figure 8 until complete...");
-    IMU.calibrateMag();
+    imu.calibrateMag();
     DPRINT("Done!");
     DWAIT(); 
 #endif
 
     //  Attach the data ready interrupt to the data ready ISR
-    IMU.enableDataReadyInterrupt();
+    imu.enableDataReadyInterrupt();
     pinMode(IMU_INT_PIN, INPUT_PULLUP);
     attachInterrupt(IMU_INT_PIN, data_ready, RISING); 
 }
@@ -204,7 +205,7 @@ void sleep()
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
   tft.setTextDatum(MC_DATUM);
   tft.drawString("Press again to wake up",  tft.width() / 2, tft.height() / 2 );
-  IMU.setSleepEnabled();
+  imu.setSleepEnabled();
   Serial.println("Go to Sleep");
   delay(3000);
   
@@ -228,13 +229,13 @@ void IMU_Show()
         
     DPRINT("--  ACC  GYR   MAG");
     tft.drawString(buff, 0, 0);
-    DPRINT("x %+06.2f  %+06.2f  %+06.2f", IMU.getAccelX_mss(), IMU.getGyroX_rads(), IMU.getMagX_uT());
+    DPRINT("x %+06.2f  %+06.2f  %+06.2f", imu.getAccelX_mss(), imu.getGyroX_rads(), imu.getMagX_uT());
     tft.drawString(buff, 0, 16);
-    DPRINT("y %+06.2f  %+06.2f  %+06.2f", IMU.getAccelY_mss(), IMU.getGyroY_rads(), IMU.getMagY_uT());
+    DPRINT("y %+06.2f  %+06.2f  %+06.2f", imu.getAccelY_mss(), imu.getGyroY_rads(), imu.getMagY_uT());
     tft.drawString(buff, 0, 32);
-    DPRINT("z %+06.2f  %+06.2f  %+06.2f", IMU.getAccelZ_mss(), IMU.getGyroZ_rads(), IMU.getMagZ_uT());
+    DPRINT("z %+06.2f  %+06.2f  %+06.2f", imu.getAccelZ_mss(), imu.getGyroZ_rads(), imu.getMagZ_uT());
     tft.drawString(buff, 0, 48);
-    float heading = atan2(IMU.getMagY_uT(), IMU.getMagX_uT()) * 180 / PI;
+    float heading = atan2(imu.getMagY_uT(), imu.getMagX_uT()) * 180 / PI;
     DPRINT("heading = %.2f", heading);
 
   }
@@ -261,8 +262,6 @@ void setup()
 
     tft.setTextColor(TFT_YELLOW, TFT_BLACK); // Note: the new fonts do not draw the background colour
 
-    targetTime = millis() + 1000;
-
     pinMode(TP_PIN_PIN, INPUT);
     //! Must be set to pull-up output mode in order to wake up in deep sleep mode
     pinMode(TP_PWR_PIN, PULLUP);
@@ -278,6 +277,10 @@ void setup()
     if (digitalRead(CHARGE_PIN) == LOW) {
         charge_indication = true;
     }
+
+#ifndef IMU_SHOW
+    tft.writecommand(ST7735_DISPOFF);
+#endif
 }
 
 void loop()
@@ -290,20 +293,18 @@ void loop()
     if (otaStart)
         return;
 
+    // button handling
     if (digitalRead(TP_PIN_PIN) == HIGH) {
         if (!pressed) {
-            initial = 1;
-            targetTime = millis() + 1000;
-            tft.fillScreen(TFT_BLACK);
-            omm = 99;
+            targetTimeForSleep = millis() + 3000;
+
             digitalWrite(LED_PIN, HIGH);
             delay(100);
             digitalWrite(LED_PIN, LOW);
             pressed = true;
-            pressedTime = millis();
         } else {
-            if (millis() - pressedTime > 3000) {
- //             sleep();
+            if (millis() >= targetTimeForSleep) {
+                sleep();
             }
         }
     } else {
@@ -311,11 +312,17 @@ void loop()
     }
 
     // read the IMU
-    IMU.readSensor();
+    imu.readSensor();
 
 #ifdef IMU_SHOW
     IMU_Show();
     delay(200);
+#endif
+
+#ifdef SEND_TO_OPENTRACK
+    OpenTrackPackage pack;
+    pack.yaw = atan2(imu.getMagY_uT(), imu.getMagX_uT()) * 180 / PI;
+    openTrackSend(pack);
 #endif
 
 }
