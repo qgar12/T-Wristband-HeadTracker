@@ -8,6 +8,7 @@
 #include "wifi_setup.h"
 #include "tftHelper.h"
 #include "xMPU9250.h"
+#include "openTrack.h"
 
 #define ARDUINO_OTA_UPDATE      //! Enable this line OTA update
 //#define CALIBRATE_MAGNETOMETER //! calibrate magnemoter -> move in a 8
