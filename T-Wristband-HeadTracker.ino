@@ -39,7 +39,12 @@
 xMPU9250         imu(Wire,0x69);
 TFT_eSPI        tft = TFT_eSPI(); 
 
-// MPU9250
+// MPU9250 params
+const DlpfBandwidth dlpfBandwidth = MPU9250::DLPF_BANDWIDTH_20HZ;
+// In order to prevent aliasing, the data should be sampled at 
+// twice the frequency of the DLPF bandwidth or higher. 
+// Data Output Rate = 1000 / (1 + SRD)
+// sample rate = dlpfBandwidth * 2 / (1 + SMPLRT_DIV)
 
 // vars
 char buff[256];
