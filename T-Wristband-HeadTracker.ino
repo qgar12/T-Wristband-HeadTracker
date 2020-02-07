@@ -35,6 +35,16 @@
 xMPU9250         IMU(Wire,0x69);
 TFT_eSPI        tft = TFT_eSPI(); 
 
+// vars
+char buff[256];
+bool initial = 1;
+bool otaStart = false;
+uint32_t targetTime = 0;       // for next 1 second timeout
+uint8_t omm = 99;
+bool pressed = false;
+uint32_t pressedTime = 0;
+bool charge_indication = false;
+
 // Flag set to indicate MPU 9250 data is ready (will be set in interrupt service routine ISR)
 volatile bool imu_data_ready = false;
 
@@ -285,7 +295,6 @@ void loop()
             targetTime = millis() + 1000;
             tft.fillScreen(TFT_BLACK);
             omm = 99;
-            func_select = func_select + 1 > 2 ? 0 : func_select + 1;
             digitalWrite(LED_PIN, HIGH);
             delay(100);
             digitalWrite(LED_PIN, LOW);
@@ -304,7 +313,7 @@ void loop()
     IMU.readSensor();
 
 #ifdef IMU_SHOW
-    IMU_ShowHeading();
+    IMU_Show();
     delay(200);
 #endif
 
