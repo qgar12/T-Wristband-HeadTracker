@@ -4,8 +4,8 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 
-const int serverPort = 4242;								// para udp nada mas
-const char* serverIpStr = "192.168.1.2";
+const int openTrackServerPort = 4242;								
+const char* openTrackServerIpStr = "192.168.0.54";
 
 WiFiUDP UDP;
 
@@ -20,7 +20,7 @@ struct OpenTrackPackage {
 
 void openTrackSend(OpenTrackPackage pack) {
 
-    UDP.beginPacket(serverIpStr, serverPort);
+    UDP.beginPacket(openTrackServerIpStr, openTrackServerPort);
     UDP.write((byte *)&pack,sizeof pack);		
     UDP.endPacket();
 

@@ -1,7 +1,6 @@
 #include <TFT_eSPI.h>     // Graphics and font library for ST7735 driver chip (see https://github.com/Bodmer/TFT_eSPI.git)
 #include <SPI.h>          // Serial Peripheral Interface (SPI) 
-#include <Wire.h>         // I2C library
-#include <WiFi.h>
+#include <Preferences.h>  // ESP32 Preferences / non-volatile storage
 
 // local libs
 #include "ttgo.h"
@@ -9,12 +8,16 @@
 #include "tftHelper.h"
 #include "xMPU9250.h"
 #include "openTrack.h"
+#include "faceTrackNoIr.h"
 
 // switches
 #define ARDUINO_OTA_UPDATE      //! Enable this line OTA update
 //#define CALIBRATE_MAGNETOMETER //! calibrate magnemoter -> move in a 8
-#define IMU_SHOW
-#define SEND_TO_OPENTRACK
+//#define SAVE_MAGNETOMETER_CALIB_TO_EEPROM
+#define LOAD_MAGNETOMETER_CALIB_FROM_EEPROM
+//#define SHOW_HEADING            //! show current heading on display
+//#define SEND_TO_OPENTRACK
+#define SEND_TO_FACETRACK
 
 // libs for OTA
 #ifdef ARDUINO_OTA_UPDATE
@@ -36,15 +39,34 @@
 #define CHARGE_PIN          32
 
 // chips
-xMPU9250         imu(Wire,0x69);
+xMPU9250        imu(Wire,0x69);
 TFT_eSPI        tft = TFT_eSPI(); 
+Preferences     pref;
+
+// consts
+const char* myName="BeatWatch";
+const float R2D = 180.0f / PI;  // conversion radians to degrees 
 
 // MPU9250 params
-const DlpfBandwidth dlpfBandwidth = MPU9250::DLPF_BANDWIDTH_20HZ;
-// In order to prevent aliasing, the data should be sampled at 
-// twice the frequency of the DLPF bandwidth or higher. 
-// Data Output Rate = 1000 / (1 + SRD)
-// sample rate = dlpfBandwidth * 2 / (1 + SMPLRT_DIV)
+//
+// Sample rate divider:
+//
+// The magnetometer is fixed to an output rate of:
+// - 100 Hz for frequencies of 100 Hz or above (SRD less than or equal to 9)
+// - 8 Hz for frequencies below 100 Hz (SRD greater than 9)
+//
+// When the data is read above the selected output rate, the read data will be stagnant. 
+// For example, when the output rate is selected to 1000 Hz, the magnetometer data will be 
+// the same for 10 sequential frames.
+//
+// -> let's use 8 Hz and there fore srd > 9
+const uint8_t imuSrd = 10;
+
+// poll rate for 8 Hz
+uint32_t imuPollRateMs = 0.9 * (1000.0 / 8.0);
+
+//! NOT USED FOR MAGNEMOTEMTER ONLY const MPU9250::DlpfBandwidth dlpfBandwidth = MPU9250::DLPF_BANDWIDTH_10HZ;
+
 
 // vars
 char buff[256];
@@ -55,7 +77,12 @@ uint32_t targetTimeForSleep = 0;
 
 // vars written by interrupt service routines / ISR
 volatile bool imu_data_ready = false;
-volatile bool charge_indication = false;
+
+// output macros
+#define DCLEAR() {tftClear(&tft);}
+//#define DPRINT(...) { char b = tfdGetBuffer(); snprintf(b, sizeof(b), __VA_ARGS__); tfdPrint(b); }
+#define DPRINT(...) { char* b = tfdGetBuffer(); snprintf(tftBuffer[tftCurrentLine], sizeof(tftBuffer[tftCurrentLine]), __VA_ARGS__); tftPrint(&tft, tftBuffer[tftCurrentLine]); Serial.println(tftBuffer[tftCurrentLine]);}
+#define DWAIT() {delay(2000);}
 
 void drawProgressBar(uint16_t x0, uint16_t y0, uint16_t w, uint16_t h, uint8_t percentage, uint16_t frameColor, uint16_t barColor)
 {
@@ -111,6 +138,16 @@ void setupOTA()
     // ArduinoOTA.setPasswordHash("21232f297a57a5a743894a0e4a801fc3");
 
     ArduinoOTA.onStart([]() {
+        imu.disableDataReadyInterrupt();
+
+#ifndef SHOW_HEADING
+        // see https://forums.adafruit.com/viewtopic.php?f=22&t=39675
+        tft.writecommand(ST7735_DISPON);
+        tft.writecommand(ST7735_SLPIN);
+        delay(150);
+        tft.init();
+#endif
+  
         String type;
         if (ArduinoOTA.getCommand() == U_FLASH)
             type = "sketch";
@@ -147,7 +184,6 @@ void setupOTA()
         tft.drawString("Update Failed", tft.width() / 2 - 20, 55 );
         delay(3000);
         otaStart = false;
-        targetTime = millis() + 1000;
         tft.fillScreen(TFT_BLACK);
         tft.setTextDatum(TL_DATUM);
     });
@@ -160,10 +196,56 @@ void setupOTA()
 }
 
 // ISR to set data ready flag */
-void data_ready()
+void IRAM_ATTR data_ready()
 {
   imu_data_ready = true;
 }
+
+// macros to store calibration in esp32 preferences
+#define PUT_TO_PREF(PREF)             \
+  float old##PREF = imu.get##PREF();  \
+  pref.putFloat(#PREF, old##PREF);    \
+  DPRINT(#PREF "=%06f", old##PREF);
+
+#ifdef SAVE_MAGNETOMETER_CALIB_TO_EEPROM
+  #define SET_FROM_PREF(PREF_BIAS, PREF_SCALE, SET_TO) {                      \
+    float_t bias = pref.getFloat(#PREF_BIAS);                                 \
+    float_t scale = pref.getFloat(#PREF_SCALE);                               \
+    if (bias == NAN) {                                                        \
+      DPRINT(#PREF_BIAS "is NAN!!");                                          \
+    }                                                                         \
+    else if (scale == NAN) {                                                  \
+      DPRINT(#PREF_SCALE "is NAN!!");                                         \
+    }                                                                         \
+    else if (old##PREF_BIAS != bias) {         \
+      DPRINT(#PREF_BIAS "Different than write!!");                            \
+      DPRINT("%06f / %06f", old##PREF_BIAS, bias);                            \
+    }                                                                         \
+    else if (old##PREF_SCALE != scale) {       \
+      DPRINT(#PREF_SCALE "Different than write!!");                           \
+      DPRINT("%06f / %06f", old##PREF_SCALE, scale);                          \
+    }                                                                         \ 
+    else {                                                                    \
+      imu.set##SET_TO(bias, scale);                                           \
+    }                                                                         \
+  }
+#else
+  #define SET_FROM_PREF(PREF_BIAS, PREF_SCALE, SET_TO) {                      \
+    float_t bias = pref.getFloat(#PREF_BIAS);                                 \
+    float_t scale = pref.getFloat(#PREF_SCALE);                               \
+    if (bias == NAN) {                                                        \
+      DPRINT(#PREF_BIAS "is NAN!!");                                          \
+    }                                                                         \
+    else if (scale == NAN) {                                                  \
+      DPRINT(#PREF_SCALE "is NAN!!");                                         \
+    }                                                                         \
+   else {                                                                     \
+      DPRINT(#PREF_BIAS "=%+06.2f", bias);                                    \
+      DPRINT(#PREF_SCALE "=%+06.2f", scale);                                  \
+      imu.set##SET_TO(bias, scale);                                           \
+    }                                                                         \
+  }
+#endif
 
 void setupMpu9250() {
     // initialize IMU 
@@ -176,13 +258,13 @@ void setupMpu9250() {
     }
     else {
       // setting the accelerometer full scale range to +/-8G 
-      imu.setAccelRange(MPU9250::ACCEL_RANGE_8G);
+//!      imu.setAccelRange(MPU9250::ACCEL_RANGE_8G);
       // setting the gyroscope full scale range to +/-500 deg/s
-      imu.setGyroRange(MPU9250::GYRO_RANGE_500DPS);
+//!      imu.setGyroRange(MPU9250::GYRO_RANGE_500DPS);
       // setting DLPF bandwidth to 20 Hz
-      imu.setDlpfBandwidth(MPU9250::DLPF_BANDWIDTH_20HZ);
+//!      imu.setDlpfBandwidth(dlpfBandwidth);
       // setting SRD to 19 for a 50 Hz update rate
-      imu.setSrd(19);
+      imu.setSrd(imuSrd);
       DPRINT("... done");
     }
     DWAIT();
@@ -198,6 +280,33 @@ void setupMpu9250() {
     DWAIT(); 
 #endif
 
+    pref.begin(myName, false);
+    
+#if defined(CALIBRATE_MAGNETOMETER) && defined(SAVE_MAGNETOMETER_CALIB_TO_EEPROM)
+    // Save calibration to Preferences
+    DCLEAR();
+    DPRINT("Saving Calibration to ESP32 Preferences");
+    PUT_TO_PREF(MagBiasX_uT);
+    PUT_TO_PREF(MagBiasY_uT);
+    PUT_TO_PREF(MagBiasZ_uT);
+    PUT_TO_PREF(MagScaleFactorX);
+    PUT_TO_PREF(MagScaleFactorY);
+    PUT_TO_PREF(MagScaleFactorZ);
+    DPRINT("Done!");
+    DWAIT();
+#endif
+
+#ifdef LOAD_MAGNETOMETER_CALIB_FROM_EEPROM
+    // Load calibration from Preferences
+    DCLEAR();
+    DPRINT("Loading Mag.Calib from ESP32");
+    SET_FROM_PREF(MagBiasX_uT, MagScaleFactorX, MagCalX);
+    SET_FROM_PREF(MagBiasY_uT, MagScaleFactorY, MagCalY);
+    SET_FROM_PREF(MagBiasY_uT, MagScaleFactorY, MagCalY);
+    DPRINT("Done!");
+    DWAIT();
+#endif  
+
     //  Attach the data ready interrupt to the data ready ISR
     imu.enableDataReadyInterrupt();
     pinMode(IMU_INT_PIN, INPUT_PULLUP);
@@ -206,6 +315,12 @@ void setupMpu9250() {
 
 void sleep() 
 {
+#ifndef SHOW_HEADING
+  // see https://forums.adafruit.com/viewtopic.php?f=22&t=39675
+  tft.writecommand(ST7735_DISPON);
+  tft.writecommand(ST7735_SLPIN);
+#endif
+  
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
   tft.setTextDatum(MC_DATUM);
@@ -225,26 +340,32 @@ void sleep()
   esp_deep_sleep_start();
 }
 
-void IMU_Show()
-{
-  if (imu_data_ready) {
-    imu_data_ready = false;
-    
-    DCLEAR();
-        
-    DPRINT("--  ACC  GYR   MAG");
-    tft.drawString(buff, 0, 0);
-    DPRINT("x %+06.2f  %+06.2f  %+06.2f", imu.getAccelX_mss(), imu.getGyroX_rads(), imu.getMagX_uT());
-    tft.drawString(buff, 0, 16);
-    DPRINT("y %+06.2f  %+06.2f  %+06.2f", imu.getAccelY_mss(), imu.getGyroY_rads(), imu.getMagY_uT());
-    tft.drawString(buff, 0, 32);
-    DPRINT("z %+06.2f  %+06.2f  %+06.2f", imu.getAccelZ_mss(), imu.getGyroZ_rads(), imu.getMagZ_uT());
-    tft.drawString(buff, 0, 48);
-    float heading = atan2(imu.getMagY_uT(), imu.getMagX_uT()) * 180 / PI;
-    DPRINT("heading = %.2f", heading);
+// calc heading with magnetometer only as described in https://github.com/bolderflight/MPU9250/issues/33
+float calcHeading() {
+    /* Read the MPU 9250 data */
+    imu.readSensor();
+    float hx = imu.getMagX_uT();
+    float hy = imu.getMagY_uT();
+    float hz = imu.getMagZ_uT();
 
-  }
-} 
+    // Normalize magnetometer data 
+    float h = sqrtf(hx * hx + hy * hy + hz * hz);
+    hx /= h;
+    hy /= h;
+    hz /= h; 
+    // Compute euler angles 
+    float yaw_rad = atan2f(-hy, hx);
+    float heading_rad = constrainAngle360(yaw_rad);
+    return heading_rad * R2D;
+}
+
+/* Bound angle between 0 and 360 */
+float constrainAngle360(float dta) {
+  dta = fmod(dta, 2.0 * PI);
+  if (dta < 0.0)
+    dta += 2.0 * PI;
+  return dta;
+}
 
 void setup()
 {
@@ -254,38 +375,40 @@ void setup()
     tft.setRotation(1);
     tft.setSwapBytes(true);
     tft.pushImage(0, 0,  160, 80, ttgo);
-
+    delay(200);
+    
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
     Wire.setClock(400000);
 
+    DCLEAR();
+    DPRINT("Build Timestamp:");
+    DPRINT(__DATE__);
+    DPRINT(__TIME__);
+    DWAIT();
 
+    // set hw components up
     setupWiFi();
     setupOTA();
     setupMpu9250();
     
-    tft.fillScreen(TFT_BLACK);
-
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK); // Note: the new fonts do not draw the background colour
-
     pinMode(TP_PIN_PIN, INPUT);
     //! Must be set to pull-up output mode in order to wake up in deep sleep mode
     pinMode(TP_PWR_PIN, PULLUP);
     digitalWrite(TP_PWR_PIN, HIGH);
 
     pinMode(LED_PIN, OUTPUT);
-
     pinMode(CHARGE_PIN, INPUT_PULLUP);
-    attachInterrupt(CHARGE_PIN, [] {
-        charge_indication = true;
-    }, CHANGE);
 
-    if (digitalRead(CHARGE_PIN) == LOW) {
-        charge_indication = true;
-    }
-
-#ifndef IMU_SHOW
+#ifdef SHOW_HEADING
+    DCLEAR();
+#else
+    // see https://forums.adafruit.com/viewtopic.php?f=22&t=39675
     tft.writecommand(ST7735_DISPOFF);
+    tft.writecommand(ST7735_SLPOUT);
+    delay(150);
 #endif
+
+    imu.disableAccAndGyro();
 }
 
 void loop()
@@ -316,18 +439,32 @@ void loop()
         pressed = false;
     }
 
-    // read the IMU
-    imu.readSensor();
+    // use imu reading
+    if (imu_data_ready) {
+      imu_data_ready = false;
+      
+      imu.readSensor();
+      float heading = calcHeading();
 
-#ifdef IMU_SHOW
-    IMU_Show();
-    delay(200);
+#ifdef SHOW_HEADING
+      DPRINT("%+06.2f", heading);
 #endif
 
 #ifdef SEND_TO_OPENTRACK
-    OpenTrackPackage pack;
-    pack.yaw = atan2(imu.getMagY_uT(), imu.getMagX_uT()) * 180 / PI;
-    openTrackSend(pack);
+      OpenTrackPackage otPack;
+      otPack.yaw = heading;
+      openTrackSend(otPack);
+#endif
+#ifdef SEND_TO_FACETRACK
+      FaceTrackPackage ftPack;
+      ftPack.yaw = heading;
+      faceTrackSend(ftPack);
 #endif
 
+      // wait for next imu readings
+      digitalWrite(LED_PIN, HIGH);
+      delay(imuPollRateMs/10);
+      digitalWrite(LED_PIN, LOW);
+      delay(imuPollRateMs*9/10);
+    }
 }

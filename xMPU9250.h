@@ -13,6 +13,12 @@ class xMPU9250 : public MPU9250 {
         void setSleepEnabled() {
             writeRegister(PWR_MGMNT_1, PWR_CYCLE);
         }
+
+        const uint8_t DIS_ACC = 0x38;
+        
+        void disableAccAndGyro() {
+          writeRegister(PWR_MGMNT_2, DIS_ACC | DIS_GYRO);
+        }
 };
 
 #endif
